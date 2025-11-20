@@ -1,3 +1,15 @@
+def _require_keras():
+    try:
+        import importlib
+        tf = importlib.import_module("tensorflow")
+        # you can use tf.keras.* everywhere; no need to import keras separately
+        return tf
+    except Exception as e:
+        raise ImportError(
+            "TensorFlow/Keras required for this function. "
+            "Install with `pip install tensorflow` or `yourpkg[cnn]`."
+        ) from e
+
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -268,23 +280,9 @@ def time_series_split(
 
     return X, y, X_train, y_train, X_val, y_val, X_test, y_test, X_mean, X_std
 
-# Save and load model bundle
-import json, zipfile, tempfile, io
-from pathlib import Path
-import numpy as np
-from keras.models import load_model
-
-# Optional dependency (only needed if you pass custom_objects)
-try:
-    import cloudpickle
-except Exception:  # pragma: no cover
-    cloudpickle = None
-
 # Save and Load fitted model
 import json, zipfile, tempfile
 from pathlib import Path
-import numpy as np
-import tensorflow as tf
 
 def save_cnn_bundle(zip_path, model, X_mean, X_std, meta=None):
     """
@@ -293,6 +291,8 @@ def save_cnn_bundle(zip_path, model, X_mean, X_std, meta=None):
       - stats.npz  (X_mean, X_std)
       - meta.json  (optional dict)
     """
+    tf = _require_keras() 
+    
     zip_path = Path(zip_path)
     zip_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -320,6 +320,8 @@ def load_cnn_bundle(zip_path, compile=False):
     Load a bundle produced by save_inference_zip().
     Returns: (model, X_mean, X_std, meta_dict)
     """
+    tf = _require_keras() 
+
     zip_path = Path(zip_path)
     with zipfile.ZipFile(zip_path, "r") as z, tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -391,9 +393,9 @@ def predict_and_plot_date(
     num_chans = []
     for k, vn in enumerate(num_var):
         a = fetch_2d(vn)
-        # normalize with training stats, then fill NaNs with 0
-        a = (a - X_mean[k]) / (1.0 if X_std[k] == 0 else X_std[k])
-        a = np.nan_to_num(a)
+        if (X_mean is not None) and (X_std is not None):
+            a = (a - X_mean[k]) / (1.0 if X_std[k] == 0 else X_std[k])
+            a = np.nan_to_num(a)
         num_chans.append(a)
 
     cat_chans = []
@@ -414,6 +416,7 @@ def predict_and_plot_date(
 
     # ---- predict
     if model_type == "cnn":
+        _ = _require_keras()  # ensure TF present only for cnn path 
         y_pred = model.predict(X_map[np.newaxis, ...], verbose=0)[0]
         if y_pred.ndim == 3 and y_pred.shape[-1] == 1:
             y_pred = y_pred[..., 0]
@@ -518,9 +521,11 @@ def plot_true_vs_predicted_year_multi(
         chans = []
         for k, v in enumerate(num_var):
             a = fetch_2d(v, date)
-            denom = 1.0 if X_std[k] == 0 else X_std[k]
-            a = (a - X_mean[k]) / denom
-            chans.append(np.nan_to_num(a))
+            if (X_mean is not None) and (X_std is not None):
+                denom = 1.0 if X_std[k] == 0 else X_std[k]
+                a = (a - X_mean[k]) / denom
+                a = np.nan_to_num(a)
+            chans.append(a)
         for v in cat_var:
             a = fetch_2d(v, date)
             chans.append(np.nan_to_num(a))
@@ -534,6 +539,7 @@ def plot_true_vs_predicted_year_multi(
         preds = []
         for mdl, mtype in zip(models, model_types):
             if mtype == "cnn":
+                _ = _require_keras()  # ensure TF present only for cnn path
                 yhat = mdl.predict(X_map[np.newaxis, ...], verbose=0)[0]
                 if yhat.ndim == 3 and yhat.shape[-1] == 1:
                     yhat = yhat[..., 0]
@@ -597,9 +603,88 @@ def plot_metric_by_month(
     training_year=None, metric='r2',
     y_name='y', mask_var='ocean_mask',
     ssim_win_size=None, ssim_sigma=None,
-    ymin=None, ymax=None
+    ymin=None, ymax=None,
+    model_type="cnn",
 ):
+    """
+    Plot a single monthly performance metric for one model across multiple years.
+
+    This matches the batching/branching style used in `plot_4metric_by_month`:
+    it supports CNN models (batched (H,W,C) → (H,W) predictions) and non-CNN
+    “tabular/BRT”-style models (per-day (H*W,C) → (H*W) predictions). If
+    `model_type == "cnn"`, TensorFlow/Keras is required and is imported lazily
+    via `_require_keras()`.
+
+    For each `year`:
+      1) Select one representative day per month (the first day present in that
+         month).                                   ── same behavior as your original
+      2) Build an (H, W, C) feature map by stacking:
+         - numerical vars in `num_var`, normalized with (`X_mean`, `X_std`)
+           if provided (0 std → no scaling),
+         - categorical/aux vars in `cat_var` (no normalization).
+      3) Predict for that day:
+         - CNN: `model.predict(X_map[None, ...]) → (1,H,W[,1])`.
+         - BRT/Tabular: reshape (H,W,C) → (H*W,C), predict, reshape back to (H,W).
+      4) Mask land where `mask_var == 0.0` and compute the requested metric:
+         - 'r2'  : coefficient of determination over valid pixels
+         - 'rmse': root mean squared error
+         - 'mae' : mean absolute error
+         - 'bias': mean(pred - truth)
+         - 'ssim': structural similarity (with optional `ssim_win_size` and
+                   Gaussian weighting via `ssim_sigma`). NaNs are filled with
+                   per-image means only for SSIM computation.
+      5) Plot the monthly metric values with an optional dashed style for the
+         `training_year`. `ymin`/`ymax` set common y-limits if provided.
+
+    Parameters
+    ----------
+    data : xr.Dataset
+        Contains `y_name`, `mask_var`, and all variables in `num_var`/`cat_var`,
+        with a `time` dimension and (lat, lon) grid.
+    years : sequence[int]
+        Years to evaluate (e.g., [2019, 2020]).
+    model : object
+        - If `model_type == "cnn"`: a tf.keras.Model returning (B,H,W[,1]).
+        - If `model_type in {"brt","tabular"}`: an estimator with
+          `.predict(X_2d)` producing length n_samples predictions.
+    X_mean, X_std : array-like or None
+        Per-channel stats for numerical variables in `num_var` (len == len(num_var)).
+        If None, numerical inputs are not normalized.
+    num_var, cat_var : list[str]
+        Names of numerical and categorical/aux variables to stack as channels.
+    training_year : int or None
+        If provided, that year's line is dashed and labeled "(train)".
+    metric : {'r2','rmse','mae','bias','ssim'}, default 'r2'
+        Which metric to plot per month.
+    y_name : str, default 'y'
+        Target variable in `data`.
+    mask_var : str, default 'ocean_mask'
+        Land/ocean mask; pixels with 0.0 are treated as land and masked.
+    ssim_win_size : int or None
+        SSIM window size (must be odd if provided).
+    ssim_sigma : float or None
+        If provided, enables Gaussian-weighted SSIM with this sigma.
+    ymin, ymax : float or None
+        Common y-limits for the plot. If None, Matplotlib defaults are used.
+    model_type : {'cnn','brt','tabular'}, default 'cnn'
+        Selects the prediction pathway.
+
+    Returns
+    -------
+    None
+        Displays a Matplotlib figure: month (1–12) on x-axis, the chosen metric
+        on y-axis, with one line per year.
+
+    Notes
+    -----
+    - Only one representative day per month is used (first available day).
+    - For SSIM, NaNs are filled (just for the SSIM call) with each image's mean;
+      `data_range` is derived from the truth field when possible.
+    """
     assert metric in ['r2', 'rmse', 'mae', 'bias', 'ssim']
+
+    if model_type == "cnn":
+        _ = _require_keras()  # only require TF/Keras for CNN
 
     def fetch_2d(ds, var, date, like_var):
         arr = ds[var]
@@ -625,18 +710,25 @@ def plot_metric_by_month(
             chans = []
             for k, v in enumerate(num_var):
                 a = fetch_2d(ds, v, date, y_name)
-                denom = 1.0 if X_std[k] == 0 else X_std[k]
-                a = (a - X_mean[k]) / denom
+                if X_mean is not None and X_std is not None:
+                    denom = 1.0 if X_std[k] == 0 else X_std[k]
+                    a = (a - X_mean[k]) / denom
                 chans.append(np.nan_to_num(a))
             for v in cat_var:
                 a = fetch_2d(ds, v, date, y_name)
                 chans.append(np.nan_to_num(a))
             X_map = np.stack(chans, axis=-1)
 
-            # predict
-            pred = model.predict(X_map[np.newaxis, ...], verbose=0)[0]
-            if pred.ndim == 3 and pred.shape[-1] == 1:
-                pred = pred[..., 0]
+            # predict (branch like plot_4metric_by_month)
+            if model_type == "cnn":
+                pred = model.predict(X_map[np.newaxis, ...], verbose=0)[0]
+                if pred.ndim == 3 and pred.shape[-1] == 1:
+                    pred = pred[..., 0]
+            elif model_type in ("brt", "tabular"):
+                H, W, C = X_map.shape
+                pred = model.predict(X_map.reshape(-1, C)).reshape(H, W)
+            else:
+                raise ValueError("model_type must be 'cnn' or 'brt'/'tabular'.")
 
             # truth & mask
             truth = fetch_2d(ds, y_name, date, y_name)
@@ -689,10 +781,11 @@ def plot_metric_by_month(
     plt.ylabel({'r2':"$R^2$",'rmse':"RMSE",'mae':"MAE",'bias':"Bias",'ssim':"SSIM"}[metric])
     plt.title(f"Monthly {metric.upper()} by Year")
     plt.xticks(np.arange(1,13), calendar.month_abbr[1:13])
-    plt.legend(); plt.grid(True); plt.tight_layout(); 
-    plt.ylim(ymin, ymax)
-    
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    if ymin is not None or ymax is not None:
+        plt.ylim(ymin, ymax)
     plt.show()
+
 
 def plot_4metric_by_month(
     data, years, model, X_mean, X_std, num_var, cat_var,
@@ -859,6 +952,7 @@ def plot_4metric_by_month(
 
             # ---- predict batch
             if model_type == "cnn":
+                _ = _require_keras()  # ensure TF present only for cnn path
                 X_batch = np.stack(chans_list, axis=0)  # (B, H, W, C)
                 pred_batch = model.predict(X_batch, verbose=0)
                 if pred_batch.ndim == 4 and pred_batch.shape[-1] == 1:
@@ -1015,6 +1109,7 @@ def evaluate_year_batched(
 
         # Predict this batch
         if model_type == 'cnn':
+            _ = _require_keras()  # ensure TF present only for cnn path
             pred_batch = model.predict(X_batch, verbose=0)
             if pred_batch.ndim == 4 and pred_batch.shape[-1] == 1:
                 pred_batch = pred_batch[..., 0]
@@ -1127,9 +1222,6 @@ def add_sin_coords(ds):
         lat_sin=(('lat','lon'), np.sin(latr).astype('float32')),
     )
 
-import xarray as xr
-import numpy as np
-
 def add_spherical_coords(ds, lat="lat", lon="lon"):
     """
     Add 3D unit-sphere coordinates (x_geo, y_geo, z_geo) computed from lat/lon.
@@ -1159,9 +1251,6 @@ def add_spherical_coords(ds, lat="lat", lon="lon"):
         z_geo=z_geo.astype("float32"),
     )
     
-import xarray as xr
-import numpy as np
-
 def add_seasonal_time_features(dataset, ref_var="sst"):
     """
     Add sin_time and cos_time (seasonal cycle) on (time, lat, lon).
@@ -1210,8 +1299,6 @@ def add_seasonal_time_features(dataset, ref_var="sst"):
         cos_time=cos_3d,
     )
     
-import numpy as np
-import xarray as xr
 from scipy.ndimage import distance_transform_edt
 
 def add_distance_to_coast(ds: xr.Dataset,
@@ -1257,10 +1344,6 @@ def add_distance_to_coast(ds: xr.Dataset,
                            name=out_name,
                            attrs={"units":"km", "long_name":"distance to coast (over ocean)"})
     return ds.assign({out_name: dist_da})
-
-import numpy as np
-import pandas as pd
-import xarray as xr
 
 def count_valid_days_by_month(
     ds: xr.Dataset,
@@ -1318,10 +1401,6 @@ def count_valid_days_by_month(
     counts.index.name = "month"
     counts.name = f"valid_days_{year}"
     return counts
-
-import xarray as xr
-import numpy as np
-import pandas as pd
 
 def pct_missing_by_day_year(
     ds: xr.Dataset,
