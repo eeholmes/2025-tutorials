@@ -1445,3 +1445,169 @@ def pct_missing_by_day_year(
     pct.name = f"pct_missing_{var}_{year}"
 
     return pct
+
+
+# --- Match-up Code ---
+def sample_points_fast(
+    ds: xr.Dataset,
+    year: int,
+    n: int,
+    y_name: str = "y",
+    mask_var: str = "ocean_mask",
+    seed: int = 42,
+):
+    """
+    Vectorized random sampler for chunked xarray/dask datasets (no loops).
+
+    - Draws n random times from ds.sel(time=year)
+    - Draws n random *continuous* lat/lon within the coord ranges
+    - Snaps those lat/lon to the nearest grid cell (vectorized)
+    - Gathers y and mask using a single dask vindex, sets y=NaN where mask==False
+    - Returns only rows with finite y
+
+    Returns
+    -------
+    pd.DataFrame with columns: ['time','lat','lon','y']
+      - 'lat','lon' are the original random (continuous) coordinates
+        (y is taken from the nearest grid cell).
+    """
+    import dask.array as da  # local import to keep dependencies scoped
+
+    dsy = ds.sel(time=str(year))
+    if dsy.sizes.get("time", 0) == 0:
+        raise ValueError(f"No timesteps found for year {year}.")
+
+    rng = np.random.default_rng(seed)
+
+    # ----- random time indices -----
+    T = dsy.sizes["time"]
+    t_idx = rng.integers(0, T, size=n)
+
+    # ----- random continuous lat/lon, then snap to nearest grid index -----
+    lat_vals = dsy["lat"].values
+    lon_vals = dsy["lon"].values
+
+    lat_rand = rng.uniform(lat_vals.min(), lat_vals.max(), size=n)
+    lon_rand = rng.uniform(lon_vals.min(), lon_vals.max(), size=n)
+
+    # searchsorted-based nearest-index that works for ascending or descending arrays
+    def nearest_index(coord_vals, q):
+        asc = coord_vals[0] <= coord_vals[-1]
+        base = coord_vals if asc else -coord_vals
+        tgt  = q          if asc else -q
+        idx = np.searchsorted(base, tgt, side="left")
+        idx0 = np.clip(idx - 1, 0, len(coord_vals) - 1)
+        idx1 = np.clip(idx,     0, len(coord_vals) - 1)
+        pick_right = np.abs(coord_vals[idx1] - q) < np.abs(coord_vals[idx0] - q)
+        return np.where(pick_right, idx1, idx0)
+
+    lat_i = nearest_index(lat_vals, lat_rand)
+    lon_i = nearest_index(lon_vals, lon_rand)
+
+    # ----- vindex gather for y and mask (single compute) -----
+    y_da = dsy[y_name].data  # (time, lat, lon) dask array
+    y_s  = y_da.vindex[t_idx, lat_i, lon_i]  # (n,)
+
+    m_da = dsy[mask_var]
+    if "time" in m_da.dims:
+        m_s = m_da.data.vindex[t_idx, lat_i, lon_i]
+    else:
+        m_s = m_da.data.vindex[lat_i, lon_i]
+
+    y_np, m_np = da.compute(y_s, m_s)
+
+    # apply mask: keep only ocean
+    y_np = np.where(m_np.astype(bool), y_np, np.nan)
+
+    # ----- assemble output; keep the random (continuous) lat/lon -----
+    times = pd.to_datetime(dsy["time"].values[t_idx])
+    df = pd.DataFrame(
+        {"time": times,
+         "lat":  lat_rand.astype(float),
+         "lon":  lon_rand.astype(float),
+         "y":    y_np.astype(float)}
+    )
+
+    return df.dropna(subset=["y"]).reset_index(drop=True)
+
+# --- Match-up Code ---
+def matchup_dask(
+    ds: xr.Dataset,
+    samples: np.array,
+    n: int,
+    y_name: str = "y",
+    var_name: ["lat", "lon"
+):
+    """
+    Vectorized random sampler for chunked xarray/dask datasets (no loops).
+
+    - Draws n random times from ds.sel(time=year)
+    - Draws n random *continuous* lat/lon within the coord ranges
+    - Snaps those lat/lon to the nearest grid cell (vectorized)
+    - Gathers y and mask using a single dask vindex, sets y=NaN where mask==False
+    - Returns only rows with finite y
+
+    Returns
+    -------
+    pd.DataFrame with columns: ['time','lat','lon','y']
+      - 'lat','lon' are the original random (continuous) coordinates
+        (y is taken from the nearest grid cell).
+    """
+    import dask.array as da  # local import to keep dependencies scoped
+
+    dsy = ds.sel(time=str(year))
+    if dsy.sizes.get("time", 0) == 0:
+        raise ValueError(f"No timesteps found for year {year}.")
+
+    rng = np.random.default_rng(seed)
+
+    # ----- random time indices -----
+    T = dsy.sizes["time"]
+    t_idx = rng.integers(0, T, size=n)
+
+    # ----- random continuous lat/lon, then snap to nearest grid index -----
+    lat_vals = dsy["lat"].values
+    lon_vals = dsy["lon"].values
+
+    lat_rand = rng.uniform(lat_vals.min(), lat_vals.max(), size=n)
+    lon_rand = rng.uniform(lon_vals.min(), lon_vals.max(), size=n)
+
+    # searchsorted-based nearest-index that works for ascending or descending arrays
+    def nearest_index(coord_vals, q):
+        asc = coord_vals[0] <= coord_vals[-1]
+        base = coord_vals if asc else -coord_vals
+        tgt  = q          if asc else -q
+        idx = np.searchsorted(base, tgt, side="left")
+        idx0 = np.clip(idx - 1, 0, len(coord_vals) - 1)
+        idx1 = np.clip(idx,     0, len(coord_vals) - 1)
+        pick_right = np.abs(coord_vals[idx1] - q) < np.abs(coord_vals[idx0] - q)
+        return np.where(pick_right, idx1, idx0)
+
+    lat_i = nearest_index(lat_vals, lat_rand)
+    lon_i = nearest_index(lon_vals, lon_rand)
+
+    # ----- vindex gather for y and mask (single compute) -----
+    y_da = dsy[y_name].data  # (time, lat, lon) dask array
+    y_s  = y_da.vindex[t_idx, lat_i, lon_i]  # (n,)
+
+    m_da = dsy[mask_var]
+    if "time" in m_da.dims:
+        m_s = m_da.data.vindex[t_idx, lat_i, lon_i]
+    else:
+        m_s = m_da.data.vindex[lat_i, lon_i]
+
+    y_np, m_np = da.compute(y_s, m_s)
+
+    # apply mask: keep only ocean
+    y_np = np.where(m_np.astype(bool), y_np, np.nan)
+
+    # ----- assemble output; keep the random (continuous) lat/lon -----
+    times = pd.to_datetime(dsy["time"].values[t_idx])
+    df = pd.DataFrame(
+        {"time": times,
+         "lat":  lat_rand.astype(float),
+         "lon":  lon_rand.astype(float),
+         "y":    y_np.astype(float)}
+    )
+
+    return df.dropna(subset=["y"]).reset_index(drop=True)
