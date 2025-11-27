@@ -1298,6 +1298,91 @@ def add_seasonal_time_features(dataset, ref_var="sst"):
         sin_time=sin_3d,
         cos_time=cos_3d,
     )
+
+import numpy as np
+import pandas as pd
+
+def add_solar_time_features_df(
+    df,
+    time_col="time",
+    lon_col="lon",
+    prefix="solar",
+    assume_lon_range="auto",
+):
+    """
+    Add local solar time features to a pandas DataFrame.
+
+    Adds columns:
+      - f"{prefix}_hour"          : local solar time in hours [0, 24)
+      - f"{prefix}_sin_time"      : sin(2π * hour / 24)
+      - f"{prefix}_cos_time"      : cos(2π * hour / 24)
+
+    Local solar time is approximated as:
+        solar_hour = (UTC_hour + lon_east / 15) % 24
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain time and longitude columns.
+    time_col : str, default "time"
+        Name of the datetime-like column.
+    lon_col : str, default "lon"
+        Name of the longitude column (degrees, either [-180, 180] or [0, 360]).
+    prefix : str, default "solar"
+        Prefix for created columns: "<prefix>_hour", "<prefix>_sin_time", "<prefix>_cos_time".
+    assume_lon_range : {"auto", "180", "360"}, default "auto"
+        How to interpret longitude range:
+        - "auto": if any lon > 180, assume [0, 360] and convert to [-180, 180]
+        - "180" : assume already in [-180, 180]
+        - "360" : assume in [0, 360], convert to [-180, 180]
+
+    Returns
+    -------
+    pandas.DataFrame
+        New DataFrame with added columns.
+    """
+    df = df.copy()
+
+    # Ensure time is datetime with UTC (or at least timezone-aware)
+    df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+
+    # Handle longitude range
+    lon = df[lon_col].astype(float)
+
+    if assume_lon_range == "auto":
+        if (lon > 180).any():
+            # likely 0..360, convert to -180..180
+            lon = ((lon + 180) % 360) - 180
+    elif assume_lon_range == "360":
+        lon = ((lon + 180) % 360) - 180
+    # else: "180" -> leave as-is
+
+    # Replace back into df
+    df[lon_col] = lon
+
+    # UTC hour as float: hour + minute/60 + second/3600
+    t = df[time_col].dt
+    utc_hour = t.hour + t.minute / 60.0 + t.second / 3600.0
+
+    # Local solar hour approximation
+    solar_hour = (utc_hour + lon / 15.0) % 24.0
+
+    # Cyclical encodings
+    rad = 2 * np.pi * (solar_hour / 24.0)
+    sin_t = np.sin(rad)
+    cos_t = np.cos(rad)
+
+    # Column names
+    hour_name = f"{prefix}_hour"
+    sin_name = f"{prefix}_sin_time"
+    cos_name = f"{prefix}_cos_time"
+
+    df[hour_name] = solar_hour.astype("float32")
+    df[sin_name] = sin_t.astype("float32")
+    df[cos_name] = cos_t.astype("float32")
+
+    return df
+
     
 from scipy.ndimage import distance_transform_edt
 
@@ -1530,13 +1615,253 @@ def sample_points_fast(
 
     return df.dropna(subset=["y"]).reset_index(drop=True)
 
-# --- Match-up Code ---
+# process one file code
+import pandas as pd
+import earthaccess
+import xarray as xr
+
+def one_file_matches_old(
+    f, df,
+    ds_lat_name="lat", ds_lon_name="lon", ds_time_name="time", 
+    ds_vec_name="wavelength", ds_var_name="Rrs",
+    df_lat_name="lat", df_lon_name="lon", df_time_name="time",
+    df_var_name="y"
+):
+    with xr.open_dataset(f, chunks={}, cache=False) as ds:
+
+        # --- Step 1: subset df to the time window in ds
+        t_start = pd.to_datetime(ds.attrs["time_coverage_start"], utc=True)
+        t_end   = pd.to_datetime(ds.attrs["time_coverage_end"], utc=True)
+        df_times = pd.to_datetime(df[df_time_name], utc=True)
+        # df points that are in this record
+        df_record = df[(df_times >= t_start) & (df_times < t_end)]
+
+        # Stop if no points in df are in the record
+        if df_record.empty: return None, None
+
+        # --- Step 2: Get an array of Rrs values for the lat/lon in df_day
+        # will need index and values later
+        lat_idx = ds.get_index(ds_lat_name)
+        lon_idx = ds.get_index(ds_lon_name)
+        lat_vals = ds[ds_lat_name].values
+        lon_vals = ds[ds_lon_name].values
+        # Get the lat/lon vals in df_day
+        df_lats = df_record[df_lat_name].to_numpy(dtype=float)
+        df_lons = df_record[df_lon_name].to_numpy(dtype=float)
+        # Use pandas indexer to quickly find indices for vals nearest points in df_record
+        lat_i = lat_idx.get_indexer(df_lats, method="nearest")
+        lon_i = lon_idx.get_indexer(df_lons, method="nearest")
+
+        # If record has only 10-100 points to match. This will be faster than .vindex
+        def sample_few_points(ds, lats, lons, var_name=ds_var_name):
+            import numpy as np
+            ds_var = ds[var_name]  # (lat, lon, wavelength)
+            spectra = [
+                ds_var.sel(lat=i, lon=j, method="nearest").values
+                for i, j in zip(lats, lons)
+            ]
+            return np.stack(spectra, axis=0)
+        
+        var_vals=sample_few_points(ds, df_lats, df_lons)    
+        
+        # --- Step 4: build a dataframe with our points and data in the xr.DataSet ---
+        data = {
+            ds_time_name: pd.to_datetime(df_record[df_time_name], utc=True),
+            ds_lat_name:  lat_vals[lat_i],
+            ds_lon_name:  lon_vals[lon_i],
+            df_var_name: df_record[df_var_name].to_numpy(),
+            "df_lat": df_lats,
+            "df_lon": df_lons
+            }
+
+        # Get the wavelength values for our col names
+        if not ds_vec_name == None:
+            vec_vals = ds[ds_vec_name].values
+            for j, v in enumerate(vec_vals):
+                label = int(v) # make integer for nicer label
+                col_name = f"{ds_var_name}_{label}"
+                data[col_name] = var_vals[:, j].astype(float)
+        else:
+            data[ds_var_name] = var_vals[:].astype(float)
+
+        return df_record, pd.DataFrame(data)
+
+
+from typing import Optional, Tuple
+import xarray as xr
+import pandas as pd
+import numpy as np
+
+def one_file_matches(
+    f: "earthaccess.store.EarthAccessFile",
+    df: pd.DataFrame,
+    ds_lat_name: str = "lat",
+    ds_lon_name: str = "lon",
+    ds_time_name: str = "time",
+    ds_vec_name: Optional[str] = "wavelength",
+    ds_var_name: str = "Rrs",
+    df_lat_name: str = "lat",
+    df_lon_name: str = "lon",
+    df_time_name: str = "time",
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """
+    Match Argo point observations to a single PACE L2/L3 file and extract
+    colocated satellite values and metadata.
+
+    Parameters
+    ----------
+    f : file-like object
+        An earthaccess/open file-like handle for a single PACE granule
+        (as returned by `earthaccess.open`). This object is passed directly
+        to `xr.open_dataset` to read the granule.
+    df : pandas.DataFrame
+        A DataFrame containing Argo observations. Must include columns for
+        time, latitude, longitude, and the target Argo variable to be matched.
+
+    ds_lat_name, ds_lon_name, ds_time_name : str, optional
+        Names of the latitude, longitude, and time variables in the PACE
+        dataset. Default: "lat", "lon", "time".
+
+    ds_vec_name : str or None, optional
+        Name of the spectral dimension in the PACE dataset (e.g. "wavelength").
+        If not None, matched satellite spectra are returned with one column per
+        wavelength. If None, only a single variable is extracted.
+
+    ds_var_name : str, optional
+        Name of the satellite variable to extract from the PACE dataset
+        (e.g. "Rrs" or "chlor_a").
+
+    df_lat_name, df_lon_name, df_time_name : str, optional
+        Column names in `df` for latitude, longitude, and time.
+
+    df_var_name : str, optional
+        Column name in `df` for the Argo variable being matched.
+
+    Returns
+    -------
+    df_record : pandas.DataFrame or None
+        A subset of `df` containing only the Argo observations whose timestamps
+        fall within the PACE file's temporal coverage window. Returns None if
+        no observations fall within this window.
+
+    pts : pandas.DataFrame or None
+        A DataFrame containing colocated satellite values for each matched Argo
+        observation, including:
+            - matched PACE pixel coordinates
+            - the Argo variable value
+            - spectral satellite values (if `ds_vec_name` is provided)
+            - PACE temporal metadata (`pace_t_start`, `pace_t_end`)
+            - the PACE file name (`pace_file`)
+        Returns None if no points were matched.
+
+Examples
+    --------
+    >>> import earthaccess
+    >>> import pandas as pd
+    >>>
+    >>> # Log in and search for PACE granules (simplified example)
+    >>> earthaccess.login()
+    >>> results = earthaccess.search(
+    ...     short_name="PACE_OCI_L3M_DAY_IOP",
+    ...     temporal=("2024-03-05", "2024-03-06"),
+    ...     bounding_box=(-180, -90, 180, 90),
+    ... )
+    >>> files = earthaccess.open(results, pqdm_kwargs={"disable": True})
+    >>>
+    >>> # Load Argo matchup candidates
+    >>> df_argo = pd.read_parquet("tutorial_data/chl_argo_points.parquet")
+    >>>
+    >>> # Match a single PACE file to the Argo DataFrame
+    >>> df_record, pts = one_file_matches(
+    ...     files[0],
+    ...     df_argo,
+    ...     ds_vec_name=None,            # e.g. non-spectral variable like "chlor_a"
+    ...     ds_var_name="chlor_a",
+    ...     df_var_name="argo_chl"
+    ... )
+    
+    Notes
+    -----
+    - Time matching uses a half-open interval: `[t_start, t_end)`.
+    - Spatial matching is performed using nearest-neighbor lookup on the PACE
+      latitude/longitude grid.
+    - This function does not load full PACE granules into memory; only metadata
+      and the required pixel values are accessed.
+    - Returned DataFrames are aligned row-by-row: each row in `pts` corresponds
+      to the same row in `df_record`.
+    """
+    with xr.open_dataset(f, chunks={}, cache=False) as ds:
+
+        # --- time window in ds ---
+        t_start = pd.to_datetime(ds.attrs["time_coverage_start"], utc=True)
+        t_end   = pd.to_datetime(ds.attrs["time_coverage_end"], utc=True)
+
+        # filename / product name
+        fname = ds.attrs.get("product_name", None)
+        if fname is None:
+            src = ds.encoding.get("source", "")
+            fname = src.split("/")[-1] if "/" in src else src
+
+        df_times = pd.to_datetime(df[df_time_name], utc=True)
+        df_record = df[(df_times >= t_start) & (df_times < t_end)]
+
+        if df_record.empty:
+            return None, None
+
+        # --- spatial index / nearest lat-lon ---
+        lat_idx = ds.get_index(ds_lat_name)
+        lon_idx = ds.get_index(ds_lon_name)
+        lat_vals = ds[ds_lat_name].values
+        lon_vals = ds[ds_lon_name].values
+
+        df_lats = df_record[df_lat_name].to_numpy(dtype=float)
+        df_lons = df_record[df_lon_name].to_numpy(dtype=float)
+
+        lat_i = lat_idx.get_indexer(df_lats, method="nearest")
+        lon_i = lon_idx.get_indexer(df_lons, method="nearest")
+
+        def sample_few_points(ds, lats, lons, var_name=ds_var_name):
+            ds_var = ds[var_name]  # e.g. (lat, lon, wavelength)
+            spectra = [
+                ds_var.sel(lat=i, lon=j, method="nearest").values
+                for i, j in zip(lats, lons)
+            ]
+            return np.stack(spectra, axis=0)
+
+        var_vals = sample_few_points(ds, df_lats, df_lons)
+
+        n = len(df_record)
+
+        # --- build dataframe ---
+        data = {
+            # PACE file metadata per row
+            f"pace_{ds_var_name}_file":  np.full(n, fname),
+            f"pace_{ds_var_name}_t_start": np.full(n, t_start),
+            f"pace_{ds_var_name}_t_end":   np.full(n, t_end),
+            f"pace_{ds_var_name}_lat": lat_vals[lat_i],
+            f"pace_{ds_var_name}_lon": lon_vals[lon_i],
+        }
+
+        if ds_vec_name is not None:
+            vec_vals = ds[ds_vec_name].values
+            for j, v in enumerate(vec_vals):
+                label = int(v)
+                col_name = f"pace_{ds_var_name}_{label}"
+                data[col_name] = var_vals[:, j].astype(float)
+        else:
+            col_name = f"pace_{ds_var_name}"
+            data[col_name] = var_vals[:].astype(float)
+
+        pts = pd.DataFrame(data)
+        return df_record, pts
+
+        
 def matchup_dask(
     ds: xr.Dataset,
     samples: np.array,
     n: int,
     y_name: str = "y",
-    var_name: ["lat", "lon"
+    var_name: np.array = ["lat", "lon"]
 ):
     """
     Vectorized random sampler for chunked xarray/dask datasets (no loops).
